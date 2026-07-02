@@ -1466,8 +1466,14 @@ struct Point { int x; int y; };
 enum Color { RED, GREEN, BLUE };
 
 typedef unsigned long ulong;
-
+typedef int arr_t[10];
 typedef int (*op_t)(int);
+
+int g_counter = 0;
+static const char *g_name = "x";
+extern int errno;
+int (*g_fn_ptr)(int) = 0;
+extern int printf(const char *, ...);
 
 int double_it(int x) {
     return x * 2;
@@ -1496,6 +1502,8 @@ int main() {
 
     int *p = malloc(sizeof(int));
     free(p);
+    int local_x = 5;
+    (void)local_x;
     return 0;
 }
 `)
@@ -1529,6 +1537,14 @@ int main() {
 		debug()
 		t.Error("expected ulong typedef")
 	}
+	if findSymbolKind(result.Symbols, "arr_t", "type") == nil {
+		debug()
+		t.Error("expected arr_t array typedef")
+	}
+	if findSymbolKind(result.Symbols, "op_t", "type") == nil {
+		debug()
+		t.Error("expected op_t function-pointer typedef")
+	}
 	if findSymbolKind(result.Symbols, "add", "function") == nil {
 		debug()
 		t.Error("expected add function")
@@ -1540,6 +1556,33 @@ int main() {
 	if findSymbolKind(result.Symbols, "main", "function") == nil {
 		debug()
 		t.Error("expected main function")
+	}
+
+	// --- Symbols (global variables + prototypes, new classifyC coverage) ---
+	if findSymbolKind(result.Symbols, "g_counter", "variable") == nil {
+		debug()
+		t.Error("expected g_counter global variable")
+	}
+	if findSymbolKind(result.Symbols, "g_name", "variable") == nil {
+		debug()
+		t.Error("expected g_name static global variable (pointer type)")
+	}
+	if findSymbolKind(result.Symbols, "errno", "variable") == nil {
+		debug()
+		t.Error("expected errno extern declaration")
+	}
+	if findSymbolKind(result.Symbols, "g_fn_ptr", "variable") == nil {
+		debug()
+		t.Error("expected g_fn_ptr function-pointer variable")
+	}
+	if findSymbolKind(result.Symbols, "printf", "function") == nil {
+		debug()
+		t.Error("expected printf prototype (function kind)")
+	}
+	// Policy: locals are NOT indexed.
+	if findSymbolKind(result.Symbols, "local_x", "variable") != nil {
+		debug()
+		t.Error("expected local_x (function-body local) to be skipped")
 	}
 
 	// --- Refs (call-site extraction, new feature) ---
@@ -1601,6 +1644,7 @@ public:
 };
 
 namespace utils {
+    int g_utils_count = 0;
     void helper(int x) {}
 }
 
@@ -1656,6 +1700,12 @@ int main() {
 	if findSymbolKind(result.Symbols, "main", "function") == nil {
 		debug()
 		t.Error("expected main function")
+	}
+
+	// --- Symbols (namespace-scope variable, new classifyC C++ coverage) ---
+	if findSymbolKind(result.Symbols, "g_utils_count", "variable") == nil {
+		debug()
+		t.Error("expected g_utils_count namespace-scope variable")
 	}
 
 	// --- Refs (call-site extraction, new feature) ---

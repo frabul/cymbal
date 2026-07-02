@@ -31,3 +31,4 @@ bench/.corpus/
 
 # Local planning scratchpad
 plans/
+.scratch

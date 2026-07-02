@@ -1238,6 +1238,54 @@ func (e *symbolExtractor) classifyRuby(nodeType string, node *sitter.Node) (stri
 	return "", nil
 }
 
+// cIsFileScope reports whether a declaration node sits at translation-unit
+// scope (C) or namespace/linkage-specification scope (C++), as opposed to
+// inside a function body, control-flow block, or aggregate body. Used to
+// distinguish global variables from locals without needing parent context
+// threaded through classifyNode.
+func cIsFileScope(node *sitter.Node) bool {
+	for p := node.Parent(); p != nil; p = p.Parent() {
+		switch p.Kind() {
+		case "translation_unit", "namespace_definition", "linkage_specification":
+			return true
+		case "function_definition", "compound_statement",
+			"if_statement", "for_statement", "for_range_loop",
+			"while_statement", "do_statement", "switch_statement",
+			"case_statement",
+			"struct_specifier", "union_specifier", "class_specifier":
+			return false
+		}
+	}
+	return false
+}
+
+// cDeclaratorName unwraps a chain of declarator wrappers and returns the
+// leaf identifier-shaped node — the actual name being declared. Handles
+// the polymorphic shapes tree-sitter-c produces for `int g`, `int *g`,
+// `int (*g)(int)`, `int g[N]`, and prototypes like `extern int foo(int);`.
+// Returns nil if no name is found.
+func cDeclaratorName(node *sitter.Node) *sitter.Node {
+	for node != nil {
+		switch node.Kind() {
+		case "identifier", "field_identifier", "type_identifier":
+			return node
+		case "init_declarator", "pointer_declarator", "function_declarator",
+			"array_declarator", "parenthesized_declarator", "parenthesized_expression",
+			"reference_declarator", "qualified_identifier":
+			// Use NamedChild(0) to skip anonymous punctuation tokens
+			// (`*`, `(`, `)`, `=`, `[`, `]`, ...) that tree-sitter-c
+			// interleaves before the actual inner declarator.
+			if node.NamedChildCount() == 0 {
+				return nil
+			}
+			node = node.NamedChild(0)
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
 func (e *symbolExtractor) classifyC(nodeType string, node *sitter.Node) (string, *sitter.Node) {
 	switch nodeType {
 	case "function_definition":
@@ -1250,7 +1298,41 @@ func (e *symbolExtractor) classifyC(nodeType string, node *sitter.Node) (string,
 	case "enum_specifier":
 		return "enum", node.ChildByFieldName("name")
 	case "type_definition":
-		return "type", node.ChildByFieldName("declarator")
+		// The `"declarator"` field of a type_definition is polymorphic: a
+		// bare `type_identifier` for simple typedefs, but a
+		// function_declarator / array_declarator / pointer_declarator /
+		// parenthesized_declarator wrapper for function-pointer and array
+		// typedefs. Route through cDeclaratorName to peel those wrappers and
+		// land on the actual name node.
+		if n := cDeclaratorName(node.ChildByFieldName("declarator")); n != nil {
+			return "type", n
+		}
+	case "declaration":
+		// tree-sitter-c uses a single `declaration` node for every
+		// file-scope statement that introduces a name: `int g = 0;`,
+		// `extern int errno;`, `extern void foo(int);`, and also for
+		// local variables inside function bodies. Restrict to file
+		// scope and disambiguate by the immediate declarator child:
+		// function_declarator → prototype, init_declarator → variable,
+		// bare identifier → extern var with no initializer.
+		if !cIsFileScope(node) {
+			return "", nil
+		}
+		for i := range int(node.ChildCount()) {
+			c := node.Child(uint(i))
+			switch c.Kind() {
+			case "init_declarator":
+				if n := cDeclaratorName(c); n != nil {
+					return "variable", n
+				}
+			case "function_declarator":
+				if n := cDeclaratorName(c); n != nil {
+					return "function", n
+				}
+			case "identifier", "field_identifier", "type_identifier":
+				return "variable", c
+			}
+		}
 	}
 	return "", nil
 }
