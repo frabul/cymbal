@@ -1468,12 +1468,16 @@ enum Color { RED, GREEN, BLUE };
 typedef unsigned long ulong;
 typedef int arr_t[10];
 typedef int (*op_t)(int);
+typedef int my_int;
 
 int g_counter = 0;
 static const char *g_name = "x";
 extern int errno;
 int (*g_fn_ptr)(int) = 0;
 extern int printf(const char *, ...);
+my_int g_typedef_var;
+my_int *g_typedef_ptr;
+const char *fmt_proto(uint32_t x);
 
 int double_it(int x) {
     return x * 2;
@@ -1578,6 +1582,33 @@ int main() {
 	if findSymbolKind(result.Symbols, "printf", "function") == nil {
 		debug()
 		t.Error("expected printf prototype (function kind)")
+	}
+	// Regression: typedef-name type specifier with no initializer must
+	// still report the variable's own name, not the type. Prior to the
+	// fix, `my_int g_typedef_var;` was indexed as variable "my_int".
+	if findSymbolKind(result.Symbols, "g_typedef_var", "variable") == nil {
+		debug()
+		t.Error("expected g_typedef_var (typedef-name type, no init)")
+	}
+	if findSymbolKind(result.Symbols, "my_int", "variable") != nil {
+		debug()
+		t.Error("type name 'my_int' must not be reported as a variable")
+	}
+	if findSymbolKind(result.Symbols, "g_typedef_ptr", "variable") == nil {
+		debug()
+		t.Error("expected g_typedef_ptr (typedef-name pointer type, no init)")
+	}
+	// Regression: a function prototype whose return type is a pointer
+	// (`T *f(args);`) must be indexed as a function, not a variable.
+	// The AST puts a function_declarator inside the pointer_declarator
+	// chain, so a naive `pointer_declarator` case misclassifies it.
+	if findSymbolKind(result.Symbols, "fmt_proto", "function") == nil {
+		debug()
+		t.Error("expected fmt_proto (pointer-return prototype) as function")
+	}
+	if findSymbolKind(result.Symbols, "fmt_proto", "variable") != nil {
+		debug()
+		t.Error("fmt_proto must not be reported as a variable")
 	}
 	// Policy: locals are NOT indexed.
 	if findSymbolKind(result.Symbols, "local_x", "variable") != nil {

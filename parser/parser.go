@@ -1286,6 +1286,30 @@ func cDeclaratorName(node *sitter.Node) *sitter.Node {
 	return nil
 }
 
+// cDeclaratorIsFunction reports whether the given declarator chain
+// contains a function_declarator. Used by the declaration branch in
+// classifyC to distinguish `T *f(args);` (function prototype whose
+// return type is a pointer) from `T *p;` (pointer variable), since
+// both surface as a pointer_declarator at the top of the declaration.
+func cDeclaratorIsFunction(node *sitter.Node) bool {
+	for node != nil {
+		switch node.Kind() {
+		case "function_declarator":
+			return true
+		case "init_declarator", "pointer_declarator",
+			"array_declarator", "parenthesized_declarator", "parenthesized_expression",
+			"reference_declarator", "qualified_identifier":
+			if node.NamedChildCount() == 0 {
+				return false
+			}
+			node = node.NamedChild(0)
+		default:
+			return false
+		}
+	}
+	return false
+}
+
 func (e *symbolExtractor) classifyC(nodeType string, node *sitter.Node) (string, *sitter.Node) {
 	switch nodeType {
 	case "function_definition":
@@ -1314,7 +1338,15 @@ func (e *symbolExtractor) classifyC(nodeType string, node *sitter.Node) (string,
 		// local variables inside function bodies. Restrict to file
 		// scope and disambiguate by the immediate declarator child:
 		// function_declarator → prototype, init_declarator → variable,
-		// bare identifier → extern var with no initializer.
+		// pointer_declarator → uninitialized pointer variable, bare
+		// identifier → extern var with no initializer.
+		//
+		// `type_identifier` is intentionally absent from the fallback
+		// match list: it always denotes a type specifier (e.g. a
+		// typedef name used as a type), never the declared name. For
+		// `typedef int my_int; my_int g;` the children are
+		// `type_identifier("my_int")` + `identifier("g")`; matching the
+		// first would misreport the type as the variable name.
 		if !cIsFileScope(node) {
 			return "", nil
 		}
@@ -1329,7 +1361,19 @@ func (e *symbolExtractor) classifyC(nodeType string, node *sitter.Node) (string,
 				if n := cDeclaratorName(c); n != nil {
 					return "function", n
 				}
-			case "identifier", "field_identifier", "type_identifier":
+			case "pointer_declarator":
+				// Distinguish a pointer variable (`T *p;`) from a
+				// function prototype whose return type is a pointer
+				// (`T *f(args);`). The latter puts a function_declarator
+				// inside the pointer_declarator chain; the former does not.
+				kind := "variable"
+				if cDeclaratorIsFunction(c) {
+					kind = "function"
+				}
+				if n := cDeclaratorName(c); n != nil {
+					return kind, n
+				}
+			case "identifier", "field_identifier":
 				return "variable", c
 			}
 		}
