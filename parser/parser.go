@@ -500,8 +500,10 @@ func (e *symbolExtractor) extractRef(node *sitter.Node) (symbols.Ref, bool) {
 			return ref, true
 		}
 		return e.extractRefNewExpr(nodeType, node)
-	case "rust", "c", "cpp":
+	case "rust":
 		return e.extractRefCallExpr(nodeType, node)
+	case "c", "cpp":
+		return e.extractRefC(nodeType, node)
 	case "python":
 		return e.extractRefPythonCall(nodeType, node)
 	case "apex", "java":
@@ -1308,6 +1310,55 @@ func cDeclaratorIsFunction(node *sitter.Node) bool {
 		}
 	}
 	return false
+}
+
+// cIdentifierIsUse reports whether an identifier node is a runtime/value
+// use site rather than a declaration site. This lets refs for C/C++ cover
+// variable reads/writes like `Self.field`, `g = x`, and `return g` without
+// double-counting declarations or function callees already handled by
+// call_expression extraction.
+func cIdentifierIsUse(node *sitter.Node) bool {
+	if node == nil || node.Kind() != "identifier" {
+		return false
+	}
+	p := node.Parent()
+	if p == nil {
+		return false
+	}
+	switch p.Kind() {
+	case "call_expression",
+		"declaration", "function_declarator", "pointer_declarator",
+		"array_declarator", "parenthesized_declarator", "parameter_declaration",
+		"field_declaration", "type_definition", "struct_specifier",
+		"union_specifier", "enum_specifier", "enumerator",
+		"preproc_def", "preproc_function_def":
+		return false
+	case "init_declarator":
+		if p.NamedChildCount() <= 1 {
+			return false
+		}
+		first := p.NamedChild(0)
+		if first == nil {
+			return false
+		}
+		return first.StartByte() != node.StartByte() || first.EndByte() != node.EndByte()
+	}
+	return true
+}
+
+func (e *symbolExtractor) extractRefC(nodeType string, node *sitter.Node) (symbols.Ref, bool) {
+	if ref, ok := e.extractRefCallExpr(nodeType, node); ok {
+		return ref, true
+	}
+	if nodeType != "identifier" || !cIdentifierIsUse(node) {
+		return symbols.Ref{}, false
+	}
+	return symbols.Ref{
+		Name:     node.Utf8Text(e.src),
+		Line:     int(node.StartPosition().Row) + 1,
+		Language: e.lang,
+		Kind:     symbols.RefKindUse,
+	}, true
 }
 
 func (e *symbolExtractor) classifyC(nodeType string, node *sitter.Node) (string, *sitter.Node) {

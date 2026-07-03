@@ -1654,6 +1654,48 @@ int main() {
 	}
 }
 
+func TestFeatureCVariableUseRefs(t *testing.T) {
+	src := []byte(`typedef struct { int value; } State;
+	State Self;
+	int g = 0;
+
+	int read_self(void) {
+	    return Self.value;
+	}
+
+	int bump(void) {
+	    int x = g;
+	    g = x + g;
+	    Self.value = g;
+	    return Self.value;
+	}
+	`)
+	result, err := ParseSource(src, "test.c", "c", lang.Default.TreeSitter("c"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	countRefs := func(name string) int {
+		n := 0
+		for _, r := range result.Refs {
+			if r.Name == name {
+				n++
+			}
+		}
+		return n
+	}
+
+	if got := countRefs("Self"); got != 3 {
+		debugParseResult(t, result)
+		t.Fatalf("Self refs = %d, want 3 (two field reads, one field write receiver)", got)
+	}
+	if got := countRefs("g"); got != 4 {
+		debugParseResult(t, result)
+		t.Fatalf("g refs = %d, want 4 (init use, assign lhs/rhs, field assignment rhs)", got)
+	}
+}
+
+
 // --- C++ Language Feature Tests ---
 
 func TestFeatureCPPRefs(t *testing.T) {
