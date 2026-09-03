@@ -585,6 +585,14 @@ const (
 	metaIndexIncludeLargeFiles = "index_include_large_files"
 )
 
+// refsOverviewCap bounds the investigate refs panel while staying large
+// enough that typical symbols render all their reference sites. The true
+// total is counted separately so a capped panel can say so instead of
+// silently under-reporting (the previous cap of 20 let
+// alphabetically-early files monopolize the window, hiding refs in e.g.
+// tests/).
+const refsOverviewCap = 200
+
 func storeIndexOptions(store *Store, opts Options) error {
 	exclude, err := json.Marshal(opts.Exclude)
 	if err != nil {
@@ -912,6 +920,18 @@ func FindReferences(dbPath, name string, limit int) ([]RefResult, error) {
 	return store.FindReferences(name, limit)
 }
 
+// CountReferences returns the total number of indexed ref rows for a symbol
+// name, unrestricted by language — the number FindReferences scales toward
+// as its limit grows. The refs CLI uses it to report when a default-limited
+// result set is only a subset of what the index holds.
+func CountReferences(dbPath, name string) (int, error) {
+	store, err := openCached(dbPath)
+	if err != nil {
+		return 0, err
+	}
+	return store.CountReferencesInLangs(name, nil)
+}
+
 // FindImporters finds files that import the file containing a symbol.
 func FindImporters(dbPath, symbolName string, depth, limit int) ([]ImporterResult, error) {
 	if limit <= 0 {
@@ -1050,15 +1070,17 @@ func (e *AmbiguousError) Error() string {
 // InvestigateResult is a kind-adaptive response that returns
 // the right shape of information based on what the symbol is.
 type InvestigateResult struct {
-	Symbol       SymbolResult        `json:"symbol"`
-	Source       string              `json:"source"`
-	Kind         string              `json:"investigate_kind"`       // "function", "type", "module"
-	Refs         []RefResult         `json:"refs,omitempty"`         // callers/usages (functions)
-	Impact       []ImpactResult      `json:"impact,omitempty"`       // transitive callers (functions)
-	Members      []SymbolResult      `json:"members,omitempty"`      // methods/fields (types)
-	Outline      []SymbolResult      `json:"outline,omitempty"`      // file overview (when symbol is a file-level type)
-	Implementors []ImplementorResult `json:"implementors,omitempty"` // types that implement/conform to this (for interface/protocol/trait kinds)
-	Implements   []ImplementorResult `json:"implements,omitempty"`   // what this type implements/extends (for class-like kinds)
+	Symbol        SymbolResult        `json:"symbol"`
+	Source        string              `json:"source"`
+	Kind          string              `json:"investigate_kind"`         // "function", "type", "module"
+	Refs          []RefResult         `json:"refs,omitempty"`           // callers/usages (functions)
+	RefTotal      int                 `json:"ref_total,omitempty"`      // total ref rows for the symbol
+	RefsTruncated bool                `json:"refs_truncated,omitempty"` // true when Refs were capped
+	Impact        []ImpactResult      `json:"impact,omitempty"`         // transitive callers (functions)
+	Members       []SymbolResult      `json:"members,omitempty"`        // methods/fields (types)
+	Outline       []SymbolResult      `json:"outline,omitempty"`        // file overview (when symbol is a file-level type)
+	Implementors  []ImplementorResult `json:"implementors,omitempty"`   // types that implement/conform to this (for interface/protocol/trait kinds)
+	Implements    []ImplementorResult `json:"implements,omitempty"`     // what this type implements/extends (for class-like kinds)
 }
 
 // Investigate returns kind-adaptive context for a symbol.
@@ -1181,20 +1203,28 @@ func InvestigateResolved(dbPath string, sym SymbolResult, opts ...InvestigateOpt
 		Source: source,
 	}
 
+	fetchRefs := func() {
+		res.Refs, _ = store.FindReferencesInLangs(sym.Name, langs, refsOverviewCap)
+		if total, err := store.CountReferencesInLangs(sym.Name, langs); err == nil {
+			res.RefTotal = total
+			res.RefsTruncated = total > len(res.Refs)
+		}
+	}
+
 	switch sym.Kind {
 	case "function", "method":
 		res.Kind = "function"
-		res.Refs, _ = store.FindReferencesInLangs(sym.Name, langs, 20)
+		fetchRefs()
 		res.Impact, _ = store.FindImpactInLangs(sym.Name, langs, 2, 20)
 	case "class", "struct", "type", "interface", "trait", "enum", "object", "mixin", "extension", "protocol", "record", "actor":
 		res.Kind = "type"
 		res.Members, _ = store.ChildSymbols(sym.Name, 50, sym.File)
-		res.Refs, _ = store.FindReferencesInLangs(sym.Name, langs, 20)
+		fetchRefs()
 		res.Implementors, _ = store.FindImplementors(sym.Name, 20)
 		res.Implements, _ = store.FindImplements(sym.Name, 20)
 	default:
 		res.Kind = sym.Kind
-		res.Refs, _ = store.FindReferencesInLangs(sym.Name, langs, 20)
+		fetchRefs()
 	}
 
 	return res, nil

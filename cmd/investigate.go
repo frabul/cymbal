@@ -170,7 +170,11 @@ func investigateOnePrint(dbPath, name string, jsonOut bool, worktreeLabel string
 		if result.Kind == "function" {
 			label = "Callers"
 		}
-		fmt.Fprintf(&content, "\n# %s (%d)\n", label, len(lines))
+		if result.RefsTruncated {
+			fmt.Fprintf(&content, "\n# %s (showing %d of %d)\n", label, len(lines), result.RefTotal)
+		} else {
+			fmt.Fprintf(&content, "\n# %s (%d)\n", label, len(lines))
+		}
 		for _, l := range lines {
 			content.WriteString(l)
 			content.WriteByte('\n')

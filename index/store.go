@@ -1143,6 +1143,42 @@ func (s *Store) FindReferencesInLangs(name string, langs []string, limit int, ki
 	return results, rows.Err()
 }
 
+// CountReferencesInLangs returns the number of ref rows matching name,
+// optionally restricted to languages and kinds. It mirrors the WHERE clause
+// of FindReferencesInLangs without the ORDER BY/LIMIT, so callers can report
+// truthful totals when a refs result set was truncated by a limit.
+func (s *Store) CountReferencesInLangs(name string, langs []string, kinds ...string) (int, error) {
+	var where []string
+	var args []interface{}
+	where = append(where, "r.name = ?")
+	args = append(args, name)
+	if len(langs) > 0 {
+		langPh := strings.Repeat("?,", len(langs))
+		langPh = langPh[:len(langPh)-1]
+		where = append(where, "r.language IN ("+langPh+")")
+		for _, l := range langs {
+			args = append(args, l)
+		}
+	}
+	if len(kinds) > 0 {
+		kindPh := strings.Repeat("?,", len(kinds))
+		kindPh = kindPh[:len(kindPh)-1]
+		where = append(where, "r.kind IN ("+kindPh+")")
+		for _, k := range kinds {
+			args = append(args, k)
+		}
+	}
+	query := "SELECT COUNT(*) FROM refs r JOIN files f ON r.file_id = f.id"
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+	var n int
+	if err := s.db.QueryRow(query, args...).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // FindReferences finds files that reference a symbol name.
 // By default this surfaces any ref kind (call, use, implements); pass
 // explicit kinds to restrict (e.g. "call" to skip type-mentions).

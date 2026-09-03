@@ -97,9 +97,24 @@ func refsSymbol(dbPath, name string, limit, ctx int, jsonOut bool, includes, exc
 	if limit > 0 && len(results) > limit {
 		results = results[:limit]
 	}
+	// When the limit cut the result set short, say so: a truncation that
+	// happens to land mid-file (results are ordered by path) can otherwise
+	// look like the symbol has no references in later directories such as
+	// tests/. Only when no path filters are in play — a filtered count would
+	// need to mirror the same glob logic.
 	if len(results) == 0 {
 		fmt.Fprintf(os.Stderr, "No references found for '%s'.\n", name)
 		return nil
+	}
+
+	// dbTotal is the true number of ref rows in the index; reported in meta
+	// and as a note whenever the limit hid part of the result set.
+	var dbTotal int
+	if limit > 0 && len(includes) == 0 && len(excludes) == 0 && len(results) >= limit {
+		if total, err := index.CountReferences(dbPath, name); err == nil && total > len(results) {
+			dbTotal = total
+			fmt.Fprintf(os.Stderr, "note: showing %d of %d references (pass -n N for more)\n", len(results), dbTotal)
+		}
 	}
 
 	enriched := enrichRefs(results, ctx)
@@ -126,7 +141,12 @@ func refsSymbol(dbPath, name string, limit, ctx int, jsonOut bool, includes, exc
 	meta := []kv{{"symbol", name}}
 	if groups < len(results) {
 		meta = append(meta, kv{"groups", fmt.Sprintf("%d", groups)})
-		meta = append(meta, kv{"total_refs", fmt.Sprintf("%d", len(results))})
+		// When truncated, total_refs is the true index total, not the subset.
+		metaTotal := len(results)
+		if dbTotal > metaTotal {
+			metaTotal = dbTotal
+		}
+		meta = append(meta, kv{"total_refs", fmt.Sprintf("%d", metaTotal)})
 	} else {
 		meta = append(meta, kv{"ref_count", fmt.Sprintf("%d", len(results))})
 	}
