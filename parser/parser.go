@@ -1346,11 +1346,102 @@ func cIdentifierIsUse(node *sitter.Node) bool {
 	return true
 }
 
+// cSameNode reports whether two node handles refer to the same AST node.
+// go-tree-sitter hands out a fresh *Node per accessor call, so Go pointer
+// equality silently fails for structurally identical nodes; identity must be
+// compared by position + kind instead.
+func cSameNode(a, b *sitter.Node) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Kind() == b.Kind() && a.StartByte() == b.StartByte() && a.EndByte() == b.EndByte()
+}
+
+// cTypeIdentifierIsUse reports whether a type_identifier node is a use of
+// an existing type rather than a definition site. tree-sitter-c routes every
+// type specifier through `type_identifier` — variable/local/field/parameter
+// declarations, return types, casts, compound literals, sizeof/offsetof
+// operands — and none of those were emitted as refs while `identifier` uses
+// were. Definition sites that must stay silent:
+//
+//   - the leaf name of a typedef declarator chain, including wrapper
+//     nesting (`typedef int (*op_t)(int);` -> `op_t` under
+//     function_declarator > parenthesized_declarator > pointer_declarator);
+//   - the `name` field of a struct/union/enum/class specifier that carries a
+//     body (`struct Point { ... };` defines Point; the body-less form
+//     `struct Point p;` or a forward declaration *uses* the tag).
+func cTypeIdentifierIsUse(node *sitter.Node) bool {
+	if node == nil || node.Kind() != "type_identifier" {
+		return false
+	}
+	if cIsTypedefDeclaratorName(node) {
+		return false
+	}
+	if p := node.Parent(); p != nil {
+		switch p.Kind() {
+		case "struct_specifier", "union_specifier", "enum_specifier", "class_specifier":
+			if cSameNode(p.ChildByFieldName("name"), node) && cSpecifierHasBody(p) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// cIsTypedefDeclaratorName reports whether node is the leaf name of a
+// type_definition's declarator chain — the alias being introduced, not a
+// type being used. It climbs declarator wrappers upward while the current
+// node is the chain's NamedChild(0) (the position cDeclaratorName follows)
+// and stops at the first non-wrapper parent: a type_definition whose
+// `declarator` field is that chain means node names the typedef itself.
+func cIsTypedefDeclaratorName(node *sitter.Node) bool {
+	child, cur := node, node.Parent()
+	for cur != nil {
+		switch cur.Kind() {
+		case "parenthesized_declarator", "pointer_declarator",
+			"function_declarator", "array_declarator", "reference_declarator",
+			"parenthesized_expression", "qualified_identifier":
+			if !cSameNode(cur.NamedChild(0), child) {
+				return false
+			}
+			child, cur = cur, cur.Parent()
+		case "type_definition":
+			return cSameNode(cur.ChildByFieldName("declarator"), child)
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+// cSpecifierHasBody reports whether a struct/union/enum/class specifier
+// node includes its definition body, i.e. it introduces the tag rather than
+// merely referring to an already-declared one.
+func cSpecifierHasBody(node *sitter.Node) bool {
+	for i := range int(node.NamedChildCount()) {
+		switch node.NamedChild(uint(i)).Kind() {
+		case "field_declaration_list", "enumerator_list", "declaration_list":
+			return true
+		}
+	}
+	return false
+}
+
 func (e *symbolExtractor) extractRefC(nodeType string, node *sitter.Node) (symbols.Ref, bool) {
 	if ref, ok := e.extractRefCallExpr(nodeType, node); ok {
 		return ref, true
 	}
-	if nodeType != "identifier" || !cIdentifierIsUse(node) {
+
+	switch nodeType {
+	case "identifier":
+		if !cIdentifierIsUse(node) {
+			return symbols.Ref{}, false
+		}
+	case "type_identifier":
+		if !cTypeIdentifierIsUse(node) {
+			return symbols.Ref{}, false
+		}
+	default:
 		return symbols.Ref{}, false
 	}
 	return symbols.Ref{

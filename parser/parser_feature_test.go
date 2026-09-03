@@ -1695,6 +1695,117 @@ func TestFeatureCVariableUseRefs(t *testing.T) {
 	}
 }
 
+// Regression: typedef names and struct/enum tags used as type specifiers
+// must emit refs. tree-sitter-c models every type specifier as a
+// `type_identifier`, which extractRefC used to ignore entirely, so
+// `cymbal refs <type>` returned nothing for C types.
+func TestFeatureCTypeUseRefs(t *testing.T) {
+	src := []byte(`typedef struct { int value; } State;
+
+typedef State state_alias;
+typedef int (*cb_t)(State s);
+
+struct Point { int x; int y; };
+
+State g_state;
+
+State make_state(void) {
+    State s;
+    return s;
+}
+
+void consume(State s, struct Point p) {
+    cb_t cb;
+    (void)cb;
+    (void)sizeof(State);
+    (void)(State){0};
+}
+`)
+	result, err := ParseSource(src, "test.c", "c", lang.Default.TreeSitter("c"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	countRefs := func(name string) int {
+		n := 0
+		for _, r := range result.Refs {
+			if r.Name == name {
+				n++
+			}
+		}
+		return n
+	}
+
+	// State is used as: typedef source, cb_t parameter, global var type,
+	// return type, local var type, consume parameter, sizeof operand,
+	// compound literal — pinned exact to catch double-emission or leaks.
+	if got := countRefs("State"); got != 8 {
+		debugParseResult(t, result)
+		t.Fatalf("State refs = %d, want 8", got)
+	}
+	// Point: the defining `struct Point { ... }` must not self-ref; the
+	// body-less `struct Point p` parameter must.
+	if got := countRefs("Point"); got != 1 {
+		debugParseResult(t, result)
+		t.Fatalf("Point refs = %d, want 1 (tag use only, not definition)", got)
+	}
+	// cb_t: the function-pointer typedef name is a definition, not a use;
+	// the `cb_t cb;` local is a use.
+	if got := countRefs("cb_t"); got != 1 {
+		debugParseResult(t, result)
+		t.Fatalf("cb_t refs = %d, want 1 (local decl only)", got)
+	}
+	// state_alias only appears as the name being typedef'd — zero uses.
+	if got := countRefs("state_alias"); got != 0 {
+		debugParseResult(t, result)
+		t.Fatalf("state_alias refs = %d, want 0 (definition site)", got)
+	}
+}
+
+func TestFeatureCPPTypeUseRefs(t *testing.T) {
+	src := []byte(`typedef struct { int v; } Box;
+
+class Widget {
+public:
+    int run() { return 0; }
+};
+
+Widget make_widget() {
+    Widget w;
+    Widget *pw = &w;
+    Box b;
+    (void)b;
+    return *pw;
+}
+`)
+	result, err := ParseSource(src, "test.cpp", "cpp", lang.Default.TreeSitter("cpp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	countRefs := func(name string) int {
+		n := 0
+		for _, r := range result.Refs {
+			if r.Name == name {
+				n++
+			}
+		}
+		return n
+	}
+
+	// Widget: return type + local decl + pointer local decl.
+	if got := countRefs("Widget"); got != 3 {
+		debugParseResult(t, result)
+		t.Fatalf("Widget refs = %d, want 3", got)
+	}
+	// Widget == 3 above already pins the negatives: the defining
+	// class_specifier and the `int run()` member must not self-ref.
+	// Box: typedef name is a definition site; the local decl is the only use.
+	if got := countRefs("Box"); got != 1 {
+		debugParseResult(t, result)
+		t.Fatalf("Box refs = %d, want 1", got)
+	}
+}
 
 // --- C++ Language Feature Tests ---
 
