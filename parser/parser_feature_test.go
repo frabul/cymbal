@@ -1762,6 +1762,73 @@ void consume(State s, struct Point p) {
 	}
 }
 
+// Field symbols: struct/union/class members must be indexed as `field`
+// symbols parented to the enclosing type — the typedef name for anonymous
+// `typedef struct { ... } Name;`, the tag for `struct Name { ... }`.
+// Covers declarator wrappers (`const char *name;`), function-pointer DATA
+// members (`void (*cb)(int);` stays a field, not a function), and trailing
+// comma-separated declarators (`int x, y;` — both names, not just the first).
+func TestFeatureCFieldSymbols(t *testing.T) {
+	src := []byte(`typedef enum { RED, GREEN } Color;
+
+typedef struct {
+  const char *name;
+  Color value;
+  const char *description;
+} S3pdmEnumMemberMetadata_t;
+
+struct Point { int x, y; void (*cb)(int); int *p, *q; };
+
+union Bits { unsigned whole; };
+`)
+	res, err := ParseSource(src, "test.c", "c", lang.Default.TreeSitter("c"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	debug := func() { debugParseResult(t, res) }
+
+	// Anonymous struct typedef'd: fields parent to the typedef name.
+	for _, name := range []string{"name", "value", "description"} {
+		sym := findSymbolKind(res.Symbols, name, "field")
+		if sym == nil {
+			debug()
+			t.Fatalf("expected field %q", name)
+		}
+		if sym.Parent != "S3pdmEnumMemberMetadata_t" {
+			debug()
+			t.Errorf("field %q parent = %q, want S3pdmEnumMemberMetadata_t", name, sym.Parent)
+		}
+	}
+	// Type specifiers must not leak in as field names.
+	if findSymbolKind(res.Symbols, "char", "field") != nil {
+		debug()
+		t.Error(`"char" must not be a field`)
+	}
+	// Named struct: fields parent to the tag; every declarator in the
+	// comma list gets a symbol; the fn-pointer member is a field (it is
+	// data), not a function.
+	for _, name := range []string{"x", "y", "cb", "p", "q"} {
+		sym := findSymbolKind(res.Symbols, name, "field")
+		if sym == nil {
+			debug()
+			t.Fatalf("expected field %q in Point", name)
+		}
+		if sym.Parent != "Point" {
+			debug()
+			t.Errorf("field %q parent = %q, want Point", name, sym.Parent)
+		}
+	}
+	if findSymbolKind(res.Symbols, "cb", "function") != nil {
+		debug()
+		t.Error("function-pointer member must be a field, not a function")
+	}
+	// Named union members parent to the union tag.
+	if sym := findSymbolKind(res.Symbols, "whole", "field"); sym == nil || sym.Parent != "Bits" {
+		debug()
+		t.Error("expected whole field parented to Bits")
+	}
+}
+
 func TestFeatureCPPTypeUseRefs(t *testing.T) {
 	src := []byte(`typedef struct { int v; } Box;
 
@@ -3198,5 +3265,152 @@ export function Page() {
 	}
 	if sym.Signature != "()" {
 		t.Errorf("double-arrow factory signature = %q, want %q (update the jsUnwrapToFunction doc comment if this changed deliberately)", sym.Signature, "()")
+	}
+}
+
+// Member-access refs: `s.f` / `p->f` record a use ref for the accessed
+// field. Function-pointer calls through a field (`p->f(x)`) must NOT
+// double-emit: extractRefCallExpr already normalizes the callee to `f`.
+// Designated initializers (`.f = x`) count as field references too.
+func TestFeatureCFieldRefs(t *testing.T) {
+	src := []byte(`typedef struct {
+  const char *name;
+  int value;
+  void (*cb)(int);
+} Meta;
+
+Meta g;
+
+int read_value(Meta *m) {
+  m->value = 1;
+  m->cb(7);
+  (m->cb)(8);
+  return m->value + g.value;
+}
+
+Meta m2 = { .value = 42 };
+`)
+	result, err := ParseSource(src, "test.c", "c", lang.Default.TreeSitter("c"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	countRefs := func(name string) int {
+		n := 0
+		for _, r := range result.Refs {
+			if r.Name == name {
+				n++
+			}
+		}
+		return n
+	}
+	countKind := func(name, kind string) int {
+		n := 0
+		for _, r := range result.Refs {
+			if r.Name == name && r.Kind == kind {
+				n++
+			}
+		}
+		return n
+	}
+
+	// value: m->value (write), m->value + g.value (two reads),
+	// .value designator. Four uses total.
+	if got := countRefs("value"); got != 4 {
+		debugParseResult(t, result)
+		t.Fatalf("value refs = %d, want 4", got)
+	}
+	// cb: `m->cb(7)` yields exactly one CALL ref (no duplicate use from
+	// the field_expression); `(m->cb)(8)` is not a direct callee so it
+	// yields one USE ref.
+	if got := countKind("cb", symbols.RefKindCall); got != 1 {
+		debugParseResult(t, result)
+		t.Fatalf("cb call refs = %d, want 1", got)
+	}
+	if got := countKind("cb", symbols.RefKindUse); got != 1 {
+		debugParseResult(t, result)
+		t.Fatalf("cb use refs = %d, want 1 ((m->cb)(8))", got)
+	}
+	// Untouched field gets no refs; receivers still do.
+	if got := countRefs("name"); got != 0 {
+		debugParseResult(t, result)
+		t.Fatalf("name refs = %d, want 0", got)
+	}
+	if got := countRefs("m"); got != 4 {
+		debugParseResult(t, result)
+		t.Fatalf("m refs = %d, want 4 (all member-access receivers)", got)
+	}
+}
+
+// C++ class members ride the same classifyC path: data members are
+// fields, in-class method declarations (bare function_declarator) are
+// methods, function-pointer members stay fields, and everything parents
+// to the class symbol.
+func TestFeatureCPPClassFields(t *testing.T) {
+	src := []byte(`class Widget {
+public:
+    int count_;
+    void decl();
+    int run() { return count_; }
+    void (*fp_)(int);
+    int a, b;
+};
+
+void use(Widget *p) {
+    p->count_ = 3;
+    p->decl();
+}
+`)
+	result, err := ParseSource(src, "test.cpp", "cpp", lang.Default.TreeSitter("cpp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	debug := func() { debugParseResult(t, result) }
+
+	if findSymbolKind(result.Symbols, "Widget", "class") == nil {
+		debug()
+		t.Error("expected Widget class symbol")
+	}
+	for _, name := range []string{"count_", "fp_", "a", "b"} {
+		sym := findSymbolKind(result.Symbols, name, "field")
+		if sym == nil {
+			debug()
+			t.Fatalf("expected field %q", name)
+		}
+		if sym.Parent != "Widget" {
+			debug()
+			t.Errorf("field %q parent = %q, want Widget", name, sym.Parent)
+		}
+	}
+	// `void decl();` is a member-function declaration, not data.
+	decl := findSymbolKind(result.Symbols, "decl", "method")
+	if decl == nil {
+		debug()
+		t.Fatal("expected decl method symbol")
+	}
+	if decl.Parent != "Widget" {
+		debug()
+		t.Errorf("decl parent = %q, want Widget", decl.Parent)
+	}
+	// Member access refs work in C++ too: p->count_ is one use.
+	count := 0
+	for _, r := range result.Refs {
+		if r.Name == "count_" {
+			count++
+		}
+	}
+	// Two uses: `return count_;` inside run() (bare identifier) and
+	// `p->count_ = 3` (field_expression).
+	if count != 2 {
+		debug()
+		t.Fatalf("count_ refs = %d, want 2", count)
+	}
+	// p->decl() must not double-emit (one call ref, no use ref).
+	for _, r := range result.Refs {
+		if r.Name == "decl" && r.Kind != symbols.RefKindCall {
+			debug()
+			t.Fatalf("decl emitted non-call ref: %+v", r)
+		}
 	}
 }

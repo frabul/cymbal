@@ -1441,6 +1441,37 @@ func (e *symbolExtractor) extractRefC(nodeType string, node *sitter.Node) (symbo
 		if !cTypeIdentifierIsUse(node) {
 			return symbols.Ref{}, false
 		}
+	case "field_expression":
+		// Member access `s.f` / `p->f` records a use ref for the member
+		// name. Skipped when this node is itself the callee: extractRefCallExpr
+		// already normalizes `p->f(x)` to a call ref for `f`, mirroring how
+		// cIdentifierIsUse suppresses the bare callee identifier.
+		if p := node.Parent(); p != nil && p.Kind() == "call_expression" &&
+			cSameNode(p.ChildByFieldName("function"), node) {
+			return symbols.Ref{}, false
+		}
+		field := node.ChildByFieldName("field")
+		if field == nil || (field.Kind() != "field_identifier" && field.Kind() != "identifier") {
+			return symbols.Ref{}, false
+		}
+		return symbols.Ref{
+			Name:     field.Utf8Text(e.src),
+			Line:     int(field.StartPosition().Row) + 1,
+			Language: e.lang,
+			Kind:     symbols.RefKindUse,
+		}, true
+	case "field_designator":
+		// Designated initializer `{ .value = 1 }` — the designator names a
+		// field just as a read access does.
+		if f := findChildByType(node, "field_identifier"); f != nil {
+			return symbols.Ref{
+				Name:     f.Utf8Text(e.src),
+				Line:     int(f.StartPosition().Row) + 1,
+				Language: e.lang,
+				Kind:     symbols.RefKindUse,
+			}, true
+		}
+		return symbols.Ref{}, false
 	default:
 		return symbols.Ref{}, false
 	}
@@ -1461,8 +1492,54 @@ func (e *symbolExtractor) classifyC(nodeType string, node *sitter.Node) (string,
 		}
 	case "struct_specifier":
 		return "struct", node.ChildByFieldName("name")
+	case "union_specifier":
+		// Named `union U { ... };` — same parenting need as struct.
+		return "union", node.ChildByFieldName("name")
 	case "enum_specifier":
 		return "enum", node.ChildByFieldName("name")
+	case "class_specifier":
+		// C++ classes (the node kind never occurs in C). Without this the
+		// enclosing class would not be a symbol and its members would be
+		// parented to nothing.
+		return "class", node.ChildByFieldName("name")
+	case "field_identifier", "identifier", "pointer_declarator",
+		"array_declarator", "parenthesized_declarator", "init_declarator",
+		"function_declarator":
+		// Struct/union/class member. Classify the declarator nodes that are
+		// DIRECT children of a field_declaration — not the field_declaration
+		// itself. Two reasons:
+		//
+		//   - tree-sitter only tags the first comma-separated declarator with
+		//     the `declarator` field (`y` in `int x, y;` is an untagged sibling),
+		//     so a field_declaration-level classifier can emit just one name;
+		//     classifying each direct declarator child emits all of them.
+		//   - walk() parents children to the nearest enclosing symbol. If
+		//     field_declaration itself were the symbol (`x`), trailing siblings
+		//     would be walked as children of `x` and mis-parented to it.
+		//
+		// Peel the declarator chain with cDeclaratorName (handles wrappers
+		// like `const char *name;` and fn-pointer data members). Anonymous
+		// members/bitfields (`union { int lo; };`, `int : 3;`) have no name
+		// child and fall through nil.
+		if p := node.Parent(); p == nil || p.Kind() != "field_declaration" {
+			return "", nil
+		}
+		name := cDeclaratorName(node)
+		if name == nil {
+			return "", nil
+		}
+		// C++ in-class method declaration (`void decl();`): a
+		// function_declarator wrapping a bare name directly. A fn-pointer
+		// DATA member (`void (*fp)(int);`) nests the name inside a
+		// parenthesized_declarator, so it stays a field. This shape is
+		// impossible in C (grammar-invalid inside a struct).
+		if node.Kind() == "function_declarator" {
+			if inner := node.ChildByFieldName("declarator"); inner != nil &&
+				(inner.Kind() == "identifier" || inner.Kind() == "field_identifier") {
+				return "method", name
+			}
+		}
+		return "field", name
 	case "type_definition":
 		// The `"declarator"` field of a type_definition is polymorphic: a
 		// bare `type_identifier` for simple typedefs, but a

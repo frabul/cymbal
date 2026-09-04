@@ -45,7 +45,7 @@ func SymbolScore(r SymbolResult) int {
 
 	// Kind priority.
 	switch r.Kind {
-	case "class", "struct", "interface", "type":
+	case "class", "struct", "union", "interface", "type":
 		score += 60
 	case "function":
 		score += 50
